@@ -1,0 +1,14 @@
+{
+  "name": "EMBER — Offline Survival Console",
+  "short_name": "EMBER",
+  "description": "A fully offline, on-device survival, knowledge, navigation and local-LLM console for grid-down scenarios.",
+  "start_url": ".",
+  "scope": ".",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#0a0908",
+  "theme_color": "#0a0908",
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}

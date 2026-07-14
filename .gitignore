@@ -1,0 +1,5 @@
+# Forge writes a timestamped backup here before every self-edit — user data, not source
+_forge_backups/
+
+.DS_Store
+.playwright-mcp/
