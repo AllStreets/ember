@@ -33,11 +33,11 @@ I built it around one scenario: the grid is down, the laptop on the table is run
 </tr>
 <tr>
 <td width="50%"><img src=".github/assets/module-navigate.png" alt="Navigate: distance, bearing and walking time between waypoints, offline" width="100%"/></td>
-<td width="50%"><img src=".github/assets/module-forge.png" alt="Forge: a plain-language request turned into a reviewed change" width="100%"/></td>
+<td width="50%"><img src=".github/assets/module-forge.png" alt="Forge review: one edited file, each check passed in plain words, and a line diff with old and new line numbers" width="100%"/></td>
 </tr>
 <tr>
 <td><em>Navigate. Walking times corrected for climbing, with no map tiles.</em></td>
-<td><em>Forge. Describe a change, review the diff, save it to disk.</em></td>
+<td><em>Forge. Every check in plain words, then the diff, then you decide.</em></td>
 </tr>
 </table>
 
@@ -83,7 +83,7 @@ If Ollama is running but EMBER says offline, allow the browser origin by startin
 
 EMBER can edit its own source code from a plain-language request, using the same local model. You describe a fix or a feature, the model proposes a change to one file, EMBER runs its validation checks on the result, and you review the diff before anything is written. Saving goes straight to disk through the File System Access API (Chrome, Edge or Brave, after connecting the folder once).
 
-Every save copies the old file into `_forge_backups/` first, so a bad edit from a small model is one click from undone. `forge-selftest.mjs` exercises the pipeline end to end.
+The review shows, for each file, what every check found in plain words (syntax, the app shell for `index.html`, and a test render on a hidden page), then a line diff with old and new line numbers. A file that fails a check can't be ticked. Every save copies the old file into `_forge_backups/` first, and the status bar that confirms the save has an Undo button. Every question Forge asks, from "save anyway?" to "revert these files?", is one accessible dialog, not a browser popup. `forge-selftest.mjs` exercises the pipeline end to end.
 
 The review step earned its place. Early on, Forge produced a tide calculator that returned hard-coded times behind a fake loading delay. It passed every automatic check, because it was valid code that returned plausible output. I caught it reading the diff and removed it ([63127c6](https://github.com/AllStreets/ember/commit/63127c6)). A change that looks right is not the same as a change that is right, which is why a person approves every write.
 

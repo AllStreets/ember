@@ -40,6 +40,207 @@ Module & helper conventions:
 
     view.innerHTML = `<div class="view-wrap" id="fg-root"></div>`;
     const root = view.querySelector('#fg-root');
+    let banner = null;        // { tone, title, body, actions:[{label, primary, run}] } shown above everything
+    let lastApply = null;     // { stamp, edited:[path], created:[path] } so the last save can be undone
+
+    // ── one accessible dialog for every question Forge asks ──
+    // Replaces alert()/confirm()/prompt(): a real dialog, focus stays inside it,
+    // Escape cancels, and focus goes back to whatever opened it. When the question
+    // is risky, the safe answer has focus, so pressing Enter by reflex does no harm.
+    function ask(o) {
+      return new Promise((resolve) => {
+        const opener = document.activeElement;
+        const id = 'fgd-' + Math.random().toString(36).slice(2, 8);
+        const danger = o.tone === 'danger';
+        const hasCancel = o.cancel !== false;
+        const list = (o.list && o.list.length) ? `<ul class="fgd-list">${o.list.map(x => `<li>${EMBER.esc(x)}</li>`).join('')}</ul>` : '';
+        const input = o.input ? `<label class="fgd-field"><span>${EMBER.esc(o.input.label)}</span><input id="${id}-in" type="text" placeholder="${EMBER.esc(o.input.placeholder || '')}" value="${EMBER.esc(o.input.value || '')}" autocomplete="off" spellcheck="false"></label>` : '';
+        const wrap = document.createElement('div');
+        wrap.className = 'fgd-scrim';
+        wrap.innerHTML = `<div class="fgd ${danger ? 'danger' : ''}" role="${danger ? 'alertdialog' : 'dialog'}" aria-modal="true" aria-labelledby="${id}-t" aria-describedby="${id}-b">
+          <h2 class="fgd-title" id="${id}-t">${EMBER.esc(o.title)}</h2>
+          <div class="fgd-body" id="${id}-b">${o.body || ''}${list}</div>
+          ${input}
+          <div class="fgd-actions">
+            ${hasCancel ? `<button class="btn ghost" data-r="cancel">${EMBER.esc(o.cancel || 'Cancel')}</button>` : ''}
+            <button class="btn ${danger ? 'danger' : 'primary'}" data-r="ok">${EMBER.esc(o.confirm || 'OK')}</button>
+          </div></div>`;
+        document.body.appendChild(wrap);
+        const box = wrap.querySelector('.fgd');
+        const field = wrap.querySelector('input');
+        const okBtn = wrap.querySelector('[data-r="ok"]'), cancelBtn = wrap.querySelector('[data-r="cancel"]');
+        const done = (val) => {
+          document.removeEventListener('keydown', onKey, true);
+          wrap.remove();
+          if (opener && opener.focus && document.contains(opener)) opener.focus();
+          resolve(val);
+        };
+        const ok = () => done(o.input ? (field.value.trim() || null) : true);
+        const cancel = () => done(o.input ? null : false);
+        okBtn.onclick = ok;
+        if (cancelBtn) cancelBtn.onclick = cancel;
+        wrap.addEventListener('mousedown', (e) => { if (e.target === wrap && hasCancel) cancel(); });
+        function onKey(e) {
+          if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); hasCancel ? cancel() : ok(); return; }
+          if (e.key === 'Enter' && field && document.activeElement === field) { e.preventDefault(); ok(); return; }
+          if (e.key === 'Tab') {
+            const f = [...box.querySelectorAll('button, input')];
+            const i = f.indexOf(document.activeElement);
+            if (i === -1) { e.preventDefault(); f[0].focus(); }
+            else if (e.shiftKey && i === 0) { e.preventDefault(); f[f.length - 1].focus(); }
+            else if (!e.shiftKey && i === f.length - 1) { e.preventDefault(); f[0].focus(); }
+          }
+        }
+        document.addEventListener('keydown', onKey, true);
+        (field || (danger && cancelBtn) || okBtn).focus();
+      });
+    }
+    const tell = (title, body) => ask({ title, body, cancel: false, confirm: 'OK' });
+    const OFFLINE = ['The local model is offline', '<p>Start Ollama, then try again. The Advisor page explains how.</p>'];
+
+    // ── the status bar above the agent: what just happened, and what you can do about it ──
+    function drawBanner() {
+      if (!banner) return '';
+      return `<div class="fg-banner ${banner.tone || ''}" role="status">
+        <div class="fg-banner-text"><b>${EMBER.esc(banner.title)}</b>${banner.body ? `<span>${banner.body}</span>` : ''}</div>
+        <div class="fg-banner-actions">${(banner.actions || []).map((a, i) => `<button class="btn sm ${a.primary ? 'primary' : 'ghost'}" data-banner="${i}">${EMBER.esc(a.label)}</button>`).join('')}
+          <button class="fg-x" data-banner="x" aria-label="Dismiss">&times;</button></div></div>`;
+    }
+    function wireBanner() {
+      root.querySelectorAll('[data-banner]').forEach(b => b.onclick = () => {
+        const k = b.dataset.banner;
+        if (k === 'x') { banner = null; draw(); } else banner.actions[+k].run();
+      });
+    }
+    function savedBanner(paths, created, unbacked) {
+      const n = paths.length;
+      const undoable = lastApply && (lastApply.edited.length || lastApply.created.length);
+      banner = { tone: 'go', title: `Saved ${n} file${n === 1 ? '' : 's'}`,
+        body: `${paths.map(p => `<code>${EMBER.esc(p)}</code>`).join(' ')}. `
+          + (unbacked.length ? `No backup could be made for ${unbacked.map(p => `<code>${EMBER.esc(p)}</code>`).join(' ')}, so Undo can't restore ${unbacked.length === 1 ? 'it' : 'them'}. ` : '')
+          + 'Reload to run the new code.',
+        actions: [{ label: 'Reload EMBER', primary: true, run: () => location.reload() }]
+          .concat(undoable ? [{ label: 'Undo this save', run: undoApply }] : []) };
+    }
+    async function dirOf(path) {
+      const parts = path.split('/'); let d = dir;
+      for (let i = 0; i < parts.length - 1; i++) d = await d.getDirectoryHandle(parts[i]);
+      return [d, parts[parts.length - 1]];
+    }
+    async function undoApply() {
+      if (!lastApply) return;
+      const { stamp, edited, created } = lastApply;
+      const all = [...edited, ...created];
+      const one = all.length === 1;
+      const yes = await ask({ title: 'Undo the last save?',
+        body: `<p>${one ? 'This file goes' : 'These files go'} back to how ${one ? 'it was' : 'they were'} before Forge wrote ${one ? 'it' : 'them'}.${created.length ? ' Files Forge created are deleted.' : ''}</p>`,
+        list: all, confirm: 'Undo', cancel: 'Keep the change' });
+      if (!yes) return;
+      try {
+        const bdir = edited.length ? await dir.getDirectoryHandle('_forge_backups') : null;
+        for (const p of edited) {
+          const h = await bdir.getFileHandle(stamp + '__' + p.replace(/\//g, '__'));
+          const text = await (await h.getFile()).text();
+          const fh = await fileHandle(p, true); const w = await fh.createWritable(); await w.write(text); await w.close();
+        }
+        for (const p of created) { const [d, name] = await dirOf(p); await d.removeEntry(name); }
+        lastApply = null;
+        files = await listFiles();
+        if (cur && all.includes(cur)) { if (files.includes(cur)) curText = await readFileText(cur); else { cur = null; curText = ''; } }
+        banner = { title: 'Save undone', body: `${all.length} file${one ? '' : 's'} restored. Reload to run the restored code.`,
+          actions: [{ label: 'Reload EMBER', primary: true, run: () => location.reload() }] };
+      } catch (e) {
+        banner = { tone: 'danger', title: 'Undo failed', body: EMBER.esc(e.message || String(e)) + '. The backups are still in <code>_forge_backups/</code>.' };
+      }
+      draw();
+    }
+
+    // ── a real line diff: common prefix and suffix trimmed, LCS on the middle,
+    // shown as hunks with three lines of context and old and new line numbers ──
+    function lineDiff(a, b) {
+      const A = a === '' ? [] : a.split('\n'), B = b === '' ? [] : b.split('\n');
+      let p = 0; while (p < A.length && p < B.length && A[p] === B[p]) p++;
+      let q = 0; while (q < A.length - p && q < B.length - p && A[A.length - 1 - q] === B[B.length - 1 - q]) q++;
+      const a2 = A.slice(p, A.length - q), b2 = B.slice(p, B.length - q);
+      const mid = [];
+      const n = a2.length, m = b2.length;
+      if (n && m && n * m <= 4e6) {
+        const W = m + 1, L = new Uint32Array((n + 1) * W);
+        for (let i = n - 1; i >= 0; i--) for (let j = m - 1; j >= 0; j--)
+          L[i * W + j] = a2[i] === b2[j] ? L[(i + 1) * W + j + 1] + 1 : Math.max(L[(i + 1) * W + j], L[i * W + j + 1]);
+        let i = 0, j = 0;
+        while (i < n && j < m) {
+          if (a2[i] === b2[j]) { mid.push(['=', i, j]); i++; j++; }
+          else if (L[(i + 1) * W + j] >= L[i * W + j + 1]) { mid.push(['-', i, -1]); i++; }
+          else { mid.push(['+', -1, j]); j++; }
+        }
+        while (i < n) mid.push(['-', i++, -1]);
+        while (j < m) mid.push(['+', -1, j++]);
+      } else {
+        for (let i = 0; i < n; i++) mid.push(['-', i, -1]);
+        for (let j = 0; j < m; j++) mid.push(['+', -1, j]);
+      }
+      const ops = [];
+      for (let i = 0; i < p; i++) ops.push({ t: '=', o: i + 1, n: i + 1, l: A[i] });
+      for (const [t, i, j] of mid) ops.push({ t, o: i >= 0 ? p + i + 1 : 0, n: j >= 0 ? p + j + 1 : 0, l: t === '+' ? b2[j] : a2[i] });
+      for (let k = 0; k < q; k++) { const oi = A.length - q + k, ni = B.length - q + k; ops.push({ t: '=', o: oi + 1, n: ni + 1, l: A[oi] }); }
+      const add = ops.filter(x => x.t === '+').length, del = ops.filter(x => x.t === '-').length;
+      if (!add && !del) return { add, del, html: '<p class="dim fg-nodiff">No changes.</p>' };
+      // group into hunks with 3 lines of context
+      const keep = new Array(ops.length).fill(false);
+      ops.forEach((x, k) => { if (x.t !== '=') for (let c = Math.max(0, k - 3); c <= Math.min(ops.length - 1, k + 3); c++) keep[c] = true; });
+      const rows = []; let shown = 0, hidden = 0, inHunk = false;
+      ops.forEach((x, k) => {
+        if (!keep[k]) { inHunk = false; return; }
+        if (!inHunk) {
+          const o = x.o || (ops.slice(k).find(y => y.o) || {}).o || 0, nn = x.n || (ops.slice(k).find(y => y.n) || {}).n || 0;
+          rows.push(`<div class="dh">Line ${nn || o}</div>`); inHunk = true;
+        }
+        if (shown >= 600) { hidden++; return; }
+        shown++;
+        const cls = x.t === '+' ? 'add' : x.t === '-' ? 'del' : 'ctx';
+        const sign = x.t === '+' ? '+' : x.t === '-' ? '&minus;' : '';
+        rows.push(`<div class="dl ${cls}"><span class="ln">${x.o || ''}</span><span class="ln">${x.n || ''}</span><span class="sg">${sign}</span><span class="tx">${EMBER.esc(x.l) || ' '}</span></div>`);
+      });
+      if (hidden) rows.push(`<div class="dh">${hidden} more changed line${hidden === 1 ? '' : 's'} not shown</div>`);
+      return { add, del, html: `<div class="fg-diff2" aria-label="Line changes: ${add} added, ${del} removed">${rows.join('')}</div>` };
+    }
+
+    // plain-language result of each check validate() ran
+    const CHECK_ICON = {
+      pass: '<svg viewBox="0 0 24 24"><path d="M20 6L9 17l-5-5"/></svg>',
+      fail: '<svg viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></svg>',
+      skip: '<svg viewBox="0 0 24 24"><path d="M5 12h14"/></svg>',
+      wait: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="6"/></svg>',
+    };
+    const CHECK_WORD = { pass: 'passed', fail: 'failed', skip: 'not applicable', wait: 'not run' };
+    function checkRows(path, v, stepFails, nSteps) {
+      v = v || { ok: true, skipped: true };
+      const row = (st, name, detail) => `<li class="fg-check ${st}"><span class="fg-ci" aria-hidden="true">${CHECK_ICON[st]}</span><span class="fg-cn">${name}<span class="sr"> ${CHECK_WORD[st]}</span></span><span class="fg-cd">${detail}</span></li>`;
+      const rows = [];
+      const syntaxChecked = /\.(js|json|webmanifest)$/.test(path);
+      if (v.stage === 'syntax') rows.push(row('fail', 'Syntax', EMBER.esc(v.msg)));
+      else rows.push(syntaxChecked ? row('pass', 'Syntax', 'parses cleanly') : row('skip', 'Syntax', 'not checked for this file type'));
+      if (/\.html$/.test(path)) {
+        rows.push(v.stage === 'html' ? row('fail', 'App shell', EMBER.esc(v.msg))
+          : v.stage === 'syntax' ? row('wait', 'App shell', 'not checked')
+          : row('pass', 'App shell', 'keeps the page structure and every script it loaded'));
+      }
+      if (v.stage === 'syntax' || v.stage === 'html') rows.push(row('wait', 'Test render', 'not run'));
+      else if (v.stage === 'render') rows.push(row('fail', 'Test render', 'crashed: ' + EMBER.esc(v.msg)));
+      else if (v.skipped) rows.push(row('skip', 'Test render', 'not a screen, so there is nothing to render'));
+      else rows.push(row('pass', 'Test render', 'ran on a hidden test page without errors'));
+      if (stepFails) rows.push(row('fail', 'Steps', `${stepFails} of ${nSteps} didn't apply`));
+      return `<ul class="fg-checks" aria-label="Checks">${rows.join('')}</ul>`;
+    }
+
+    // Cmd/Ctrl+Enter saves from the review
+    document.addEventListener('keydown', function onSaveKey(e) {
+      if (!document.contains(root)) { document.removeEventListener('keydown', onSaveKey); return; }
+      if (agent && agent.phase === 'review' && e.key === 'Enter' && (e.metaKey || e.ctrlKey) && !document.querySelector('.fgd-scrim')) {
+        e.preventDefault(); agentApplyAll();
+      }
+    });
 
     // ── tiny IndexedDB for persisting the folder handle ──
     const idb = {
@@ -87,7 +288,7 @@ Module & helper conventions:
     }
     async function connect() {
       if (location.protocol === 'file:' || !window.isSecureContext) {
-        alert('The folder picker is blocked here because EMBER was opened as a file, not served.\n\nClose this, double-click serve.command, and open http://localhost:8787 — then Connect will work. (Tip: maximise the browser window first so the folder dialog isn\'t hidden off-screen.)');
+        tell('Open EMBER from localhost first', '<p>The folder picker is blocked because EMBER was opened as a file rather than served. Double-click <code>serve.command</code>, open <code>http://localhost:8787</code>, and Connect will work.</p>');
         return;
       }
       connMsg('');
@@ -334,7 +535,7 @@ Module & helper conventions:
     }
     async function agentPlan(goal) {
       const st = window.EMBER.llmStatus;
-      if (!st || !st.online) { alert('Local LLM is offline — start Ollama (see Advisor).'); return; }
+      if (!st || !st.online) { tell(...OFFLINE); return; }
       agent = { goal, phase: 'planning', planText: '' }; draw();
       const sys = { role: 'system', content:
         `You are FORGE's planner for EMBER, an offline survival console.\n${ARCH}\n\nBreak the GOAL into an ORDERED list of small STEPS. Each step changes ONE file and does ONE focused thing. Multiple steps MAY target the SAME file — split a big single-file change into separate regional steps (e.g. add the data, then wire the handler, then add the style). Fewer steps is better; most requests are a single step.\n\nRULES:\n1. Adding/expanding INFORMATION, guides, sections, entries → ONE step on the data file (survival→data/kb.js; morse/knots/radiation→data/ref.js; plants/mushrooms/meds→data/guide.js). Never touch js/*.js for content.\n2. Changing how a screen LOOKS or BEHAVES → step(s) on that js/*.js (and css/app.css for styling).\n3. A NEW tool/module → create js/<name>.js, then edit index.html (add its <script> before js/app.js), then edit sw.js (add it to ASSETS).\n\nOutput ONLY a JSON array in a \`\`\`json code block, at most 10 items, IN EXECUTION ORDER: {"file":"...","action":"edit"|"create","step":"imperative description of this one change"}. No prose.\n\nExamples:\n- "add security info" → [{"file":"data/kb.js","action":"edit","step":"add 3 Security KB entries about OPSEC, watch rotations and de-escalation"}]\n- "add a Tides tool to the sidebar" → [{"file":"js/tides.js","action":"create","step":"create the Tides module: render() with a tide-time estimator, registered into EMBER_MODULES"},{"file":"index.html","action":"edit","step":"add <script src=\\"js/tides.js\\"> just before js/app.js"},{"file":"sw.js","action":"edit","step":"add 'js/tides.js' to the ASSETS array"}]` };
@@ -353,7 +554,7 @@ Module & helper conventions:
     }
     async function agentBuild() {
       const steps = agent.steps.filter(s => s.include);
-      if (!steps.length) { alert('Select at least one step to build.'); return; }
+      if (!steps.length) { tell('Nothing to build', '<p>Tick at least one step.</p>'); return; }
       const model = currentModel();
       agent.phase = 'building';
       agent.stepRuns = steps.map(s => ({ ...s, status: 'pending', stream: '' }));
@@ -418,50 +619,56 @@ Module & helper conventions:
       draw();
     }
     async function agentApplyAll() {
-      // apply only the files the user has TICKED (and that pass validation)
-      const chosen = (agent.results || []).filter(r => r.include && r.status === 'done' && r.text);
-      const good = chosen.filter(r => !r.v || r.v.ok);
-      const blockedSel = chosen.filter(r => r.v && !r.v.ok);
-      if (!good.length) { alert('Nothing selected to save.\n\nTick the file(s) you want to apply. Failing files must be fixed with “Redo / fix” before they can be saved.'); return; }
-      if (blockedSel.length && !confirm(`${good.length} selected file(s) will be SAVED.\n\n${blockedSel.length} selected file(s) still fail validation and will be SKIPPED (not written) so they can't break EMBER:\n${blockedSel.map(b => '• ' + b.path).join('\n')}\n\nSave the ${good.length} good file(s) now?`)) return;
+      // save only the ticked files, and only ones that passed every check
+      const good = ((agent && agent.results) || []).filter(r => r.include && r.status === 'done' && r.text && (!r.v || r.v.ok) && !r.stepFails);
+      if (!good.length) return;                      // the Save button is disabled in this case
       const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const edited = [], created = [], unbacked = [];
+      let bdir = null;
       for (const r of good) {
-        try {
-          if (r.action === 'edit') {
-            const bdir = await dir.getDirectoryHandle('_forge_backups', { create: true });
+        if (r.action === 'edit') {
+          try {
+            bdir = bdir || await dir.getDirectoryHandle('_forge_backups', { create: true });
             const bh = await bdir.getFileHandle(stamp + '__' + r.path.replace(/\//g, '__'), { create: true });
             const bw = await bh.createWritable(); await bw.write(r.base || ''); await bw.close();
+            edited.push(r.path);
+          } catch (e) {
+            const go = await ask({ tone: 'danger', title: `Couldn't back up ${r.path}`,
+              body: `<p>${EMBER.esc(e.message || String(e))}.</p><p>Without a backup, Undo can't restore this file.</p>`,
+              confirm: 'Save without a backup', cancel: 'Skip this file' });
+            if (!go) continue;
+            unbacked.push(r.path);
           }
-        } catch (e) { /* backup best-effort */ }
+        } else created.push(r.path);
         const fh = await fileHandle(r.path, true);
         const w = await fh.createWritable(); await w.write(scrubFences(r.text)); await w.close();
       }
+      const written = [...edited, ...created, ...unbacked];
+      if (!written.length) return;
       const hist = Store.get('forge.hist', []);
-      good.forEach(r => hist.unshift({ t: new Date().toLocaleString([], { hour12: false }), path: r.path, note: (r.action === 'create' ? 'created · ' : 'agent · ') + agent.goal.slice(0, 46) }));
+      written.forEach(p => hist.unshift({ t: new Date().toLocaleString([], { hour12: false }), path: p, note: (created.includes(p) ? 'created · ' : 'agent · ') + agent.goal.slice(0, 46) }));
       Store.set('forge.hist', hist.slice(0, 40));
+      lastApply = { stamp, edited, created };
       files = await listFiles();
-      const n = good.length;
-      const savedPaths = new Set(good.map(r => r.path));
-      agent.results = agent.results.filter(r => !savedPaths.has(r.path));   // applied files leave the review
-      const remaining = agent.results.length;
-      if (!remaining) {
-        agent = null; draw();
-        setTimeout(() => { if (confirm(`Saved ${n} file(s). Reload EMBER now to run the changes?`)) location.reload(); }, 50);
-      } else {
-        agent.savedNote = `Saved ${n} file(s) to disk. ${remaining} still here to redo — reload EMBER when you're done to run everything.`;
-        draw();
-      }
+      const savedPaths = new Set(written);
+      agent.results = agent.results.filter(r => !savedPaths.has(r.path));   // saved files leave the review
+      if (!agent.results.length) agent = null;
+      savedBanner(written, created, unbacked);
+      draw();
     }
 
     async function generate(reqText, fix) {
       if (!cur) return;
       const st = window.EMBER.llmStatus;
-      if (!st || !st.online) { alert('Local LLM is offline — start Ollama (see Advisor).'); return; }
+      if (!st || !st.online) { tell(...OFFLINE); return; }
       // Content-add requests belong in the DATA file, not the renderer. Editing the
       // renderer for content is what produced broken/duplicated "sections" before.
       const target = DATA_FOR[cur];
       if (!fix && target && files.includes(target) && CONTENT_RE.test(reqText)) {
-        if (confirm(`This looks like a CONTENT change (adding information / sections).\n\nThat content lives in ${target} — ${cur} only renders it. Editing ${cur} usually produces broken or duplicated results.\n\nSwitch to ${target} and add the content there?  (Recommended)`)) {
+        const sw = await ask({ title: 'This sounds like a content change',
+          body: `<p>That information lives in <code>${EMBER.esc(target)}</code>. <code>${EMBER.esc(cur)}</code> only displays it, and editing it to add content usually breaks or duplicates things.</p>`,
+          confirm: `Edit ${target} instead`, cancel: `Edit ${cur} anyway` });
+        if (sw) {
           await openFile(target);            // cur/curText now point at the data file
         }
       }
@@ -597,27 +804,34 @@ Module & helper conventions:
       if (!proposal || !cur) return;
       const v = validate(cur, proposal.text, curText);
       if (!v.ok) {
-        const label = v.stage === 'render' ? 'RUNTIME check FAILED — this code crashes when it runs:\n' : v.stage === 'html' ? 'SHELL check FAILED:\n' : 'SYNTAX check FAILED:\n';
-        if (!confirm(label + v.msg + '\n\nApply anyway? A broken file can stop that page (or all of EMBER) from loading. You can restore from _forge_backups/ or the Revert button.')) return;
+        const what = v.stage === 'render' ? 'crashes when it runs' : v.stage === 'html' ? 'would blank the whole app' : 'has a syntax error';
+        const go = await ask({ tone: 'danger', title: `This change ${what}`,
+          body: `<p class="mono fgd-err">${EMBER.esc(v.msg)}</p><p>Saving it can stop this page, or all of EMBER, from loading. You could undo it afterwards, but regenerating is safer.</p>`,
+          confirm: 'Save anyway', cancel: 'Keep reviewing' });
+        if (!go) return;
       }
-      // 1) back up the current file to _forge_backups/ on disk
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+      let backed = true;
       try {
-        const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-        const bakName = stamp + '__' + cur.replace(/\//g, '__');
         const bdir = await dir.getDirectoryHandle('_forge_backups', { create: true });
-        const bh = await bdir.getFileHandle(bakName, { create: true });
+        const bh = await bdir.getFileHandle(stamp + '__' + cur.replace(/\//g, '__'), { create: true });
         const bw = await bh.createWritable(); await bw.write(curText); await bw.close();
-      } catch (e) { if (!confirm('Could not write a backup (' + e.message + '). Apply without a backup?')) return; }
-      // 2) write the new content (scrub any stray code fence as a last guard)
+      } catch (e) {
+        const go = await ask({ tone: 'danger', title: `Couldn't back up ${cur}`,
+          body: `<p>${EMBER.esc(e.message || String(e))}.</p><p>Without a backup, Undo can't restore this file.</p>`,
+          confirm: 'Save without a backup', cancel: 'Cancel' });
+        if (!go) return;
+        backed = false;
+      }
       const fh = await fileHandle(cur, true);
       const w = await fh.createWritable(); await w.write(scrubFences(proposal.text)); await w.close();
-      // 3) log
       const hist = Store.get('forge.hist', []);
       hist.unshift({ t: new Date().toLocaleString([], { hour12: false }), path: cur, note: proposal.note || '' });
       Store.set('forge.hist', hist.slice(0, 40));
+      lastApply = { stamp, edited: backed ? [cur] : [], created: [] };
+      savedBanner([cur], [], backed ? [] : [cur]);
       curText = proposal.text; proposal = null;
       draw();
-      setTimeout(() => { if (confirm('Saved ' + cur + '. Reload EMBER now to run the change?')) location.reload(); }, 50);
     }
 
     // ── views ──
@@ -647,6 +861,7 @@ Module & helper conventions:
       const fileList = files.map(p => `<button class="fg-file ${p === cur ? 'on' : ''}" data-p="${EMBER.esc(p)}">${EMBER.esc(p)}</button>`).join('');
       const hist = Store.get('forge.hist', []);
       root.innerHTML = `
+      ${drawBanner()}
       ${drawAgentPanel()}
       <details class="fg-advanced" ${cur ? 'open' : ''}>
         <summary>Advanced — browse &amp; edit one file at a time${hist.length ? ` · ${hist.length} recent edit${hist.length === 1 ? '' : 's'}` : ''}</summary>
@@ -681,6 +896,7 @@ Module & helper conventions:
         </div>
       </details>`;
 
+      wireBanner();
       wireAgent();
       root.querySelectorAll('.fg-file').forEach(b => b.onclick = () => openFile(b.dataset.p));
       const refreshBtn = root.querySelector('#fg-refresh'); if (refreshBtn) refreshBtn.onclick = async () => { files = await listFiles(); draw(); };
@@ -700,22 +916,22 @@ Module & helper conventions:
       if (proposal.busy) { out.innerHTML = `<div class="card"><div class="eyebrow">Generating (local model)…</div><pre class="fg-code" id="fg-gen"></pre></div>`; return; }
       if (proposal.error) { out.innerHTML = `<div class="callout danger">Generation failed: ${EMBER.esc(proposal.error)}</div>`; return; }
       const v = validate(cur, proposal.text, curText);
-      const diff = makeDiff(curText, proposal.text);
-      const pill = v.ok ? (v.skipped ? 'syntax ok' : 'syntax + render ok')
-        : (v.stage === 'syntax' ? 'syntax error' : v.stage === 'html' ? 'would blank the app' : 'runtime error — would break this page');
-      out.innerHTML = `<div class="card">
-        <div class="row" style="justify-content:space-between;margin-bottom:8px">
-          <div class="eyebrow" style="margin:0">Proposed change · ${EMBER.esc(cur)}</div>
-          <span class="pill ${v.ok ? 'go' : 'danger'}">${pill}</span>
-        </div>
-        ${v.ok ? '' : `<div class="callout danger" style="margin-bottom:8px"><b>${v.stage === 'render' ? 'This code loads but crashes when it runs' : v.stage === 'html' ? 'This would blank the whole app' : 'Broken syntax'}:</b> ${EMBER.esc(v.msg)}<br><span style="font-size:12px;opacity:.85">Use “Regenerate &amp; fix errors”, or Discard. Don’t apply — it would break ${EMBER.esc(cur)}.</span></div>`}
-        <div class="fg-diff">${diff}</div>
-        <div class="row" style="margin-top:12px;flex-wrap:wrap">
-          <button class="btn primary sm" id="fg-apply"><svg viewBox="0 0 24 24"><path d="M20 6L9 17l-5-5"/></svg>Apply & save to disk</button>
-          ${v.ok ? '' : `<button class="btn sm ghost" id="fg-regen" title="Send the error back to the model and ask it to fix the code">Regenerate &amp; fix errors</button>`}
+      const d = lineDiff(curText, proposal.text);
+      out.innerHTML = `<article class="card fg-rev ${v.ok ? '' : 'bad'}">
+        <header class="fg-rev-head">
+          <span class="fg-path mono">${EMBER.esc(cur)}</span>
+          <span class="fg-badge">proposed change</span>
+          <span class="fg-stat mono"><span class="add">+${d.add}</span> <span class="del">&minus;${d.del}</span></span>
+          <span class="fg-state ${v.ok ? 'go' : 'danger'}">${v.ok ? 'ready to save' : "don't save this"}</span>
+        </header>
+        ${checkRows(cur, v)}
+        <details class="fg-diffwrap" open><summary>Changes</summary>${d.html}</details>
+        <div class="fg-rev-foot">
+          <button class="btn primary sm" id="fg-apply"><svg viewBox="0 0 24 24"><path d="M20 6L9 17l-5-5"/></svg>${v.ok ? 'Save to disk' : 'Save anyway'}</button>
+          ${v.ok ? '' : `<button class="btn sm" id="fg-regen" title="Send the error back to the model and ask it to fix the code">Regenerate and fix</button>`}
           <button class="btn sm ghost" id="fg-discard">Discard</button>
-          <span class="dim" style="font-size:12px">${v.ok ? 'backs up to _forge_backups/ first' : 'do not apply broken code — regenerate or discard'}</span>
-        </div></div>`;
+          <span class="dim fg-hint">${v.ok ? 'The current file is backed up first, and you can undo the save.' : 'Regenerating sends the error back to the model.'}</span>
+        </div></article>`;
       root.querySelector('#fg-apply').onclick = apply;
       root.querySelector('#fg-discard').onclick = () => { proposal = null; drawOut(); };
       const regen = root.querySelector('#fg-regen');
@@ -780,62 +996,83 @@ Module & helper conventions:
               <pre class="fg-code" id="ag-stream-${i}" style="max-height:60px;margin-top:6px">${EMBER.esc(s.stream || '')}</pre></div>`).join('')}</div></div>`;
       }
       if (agent.phase === 'review') {
-        const okCount = agent.results.filter(r => r.v && r.v.ok).length;
-        const selCount = agent.results.filter(r => r.include).length;
-        return `<div class="card ag-card"><div class="row" style="justify-content:space-between">
-            <div class="eyebrow" style="margin:0">Review · ${EMBER.esc(agent.goal)}</div>
-            <span class="dim" style="font-size:12px">${okCount}/${agent.results.length} pass · <span class="mono" style="font-size:11px">${EMBER.esc(Store.get('forge.model', ''))}</span></span></div>
-          ${agent.savedNote ? `<div class="callout" style="margin:8px 0;font-size:12.5px">${EMBER.esc(agent.savedNote)}</div>` : ''}
-          <div class="dim" style="font-size:12px;margin:8px 0 4px">Tick the files to save. Redo any file to regenerate just that one.</div>
-          <div style="margin-top:6px">${agent.results.map((r, i) => agentReviewCard(r, i)).join('')}</div>
-          <div class="row" style="margin-top:12px;flex-wrap:wrap;align-items:center">
-            <button class="btn primary sm" id="ag-apply"><svg viewBox="0 0 24 24"><path d="M20 6L9 17l-5-5"/></svg>Apply selected (${selCount})</button>
-            <button class="btn sm ghost" id="ag-cancel">Discard all</button>
-            <span class="dim" style="font-size:12px">edited files are backed up to _forge_backups/ first</span></div></div>`;
+        const rs = agent.results;
+        const ready = rs.filter(r => r.status === 'done' && r.v && r.v.ok && !r.stepFails);
+        const busy = rs.filter(r => r.status === 'working').length;
+        const failing = rs.length - ready.length - busy;
+        const nSel = rs.filter(r => r.include).length;
+        const many = rs.length !== 1;
+        const summary = !rs.length ? "Forge didn't change any files."
+          : failing ? `${failing} of ${rs.length} file${many ? 's' : ''} failed a check. ${failing === 1 ? 'It' : 'They'} can't be saved until you redo ${failing === 1 ? 'it' : 'them'}.`
+          : busy ? 'Redoing a file…'
+          : `Forge changed ${rs.length} file${many ? 's' : ''}, and ${many ? 'all of them' : 'it'} passed every check.`;
+        return `<section class="card ag-card fg-review" aria-labelledby="fg-review-h">
+          <div class="fg-review-head">
+            <div style="min-width:0">
+              <div class="eyebrow" style="margin:0">Review before saving</div>
+              <h3 id="fg-review-h" class="fg-goal">${EMBER.esc(agent.goal)}</h3>
+              <p class="fg-sum">${summary}</p>
+            </div>
+            <span class="dim mono fg-model-tag" title="Model that wrote these changes">${EMBER.esc(Store.get('forge.model', ''))}</span>
+          </div>
+          <div class="fg-revlist">${rs.map((r, i) => agentReviewCard(r, i)).join('')}</div>
+          <div class="fg-review-foot">
+            <button class="btn primary" id="ag-apply" ${nSel ? '' : 'disabled'}><svg viewBox="0 0 24 24"><path d="M20 6L9 17l-5-5"/></svg><span id="ag-apply-l">Save ${nSel} file${nSel === 1 ? '' : 's'}</span></button>
+            <button class="btn ghost" id="ag-cancel">Discard all</button>
+            <span class="dim fg-hint">Edited files are backed up before anything is written, and the save can be undone. <kbd>&#8984;</kbd><kbd>&#8629;</kbd> saves.</span>
+          </div></section>`;
       }
       return '';
     }
     function agentReviewCard(r, i) {
-      if (r.status === 'error') return `<div class="ag-rev"><div class="row" style="justify-content:space-between"><b class="mono">${EMBER.esc(r.path)}</b><span class="pill danger">failed</span></div><div class="callout danger" style="margin-top:6px">${EMBER.esc(r.err || 'generation failed')}</div>
-        <div class="row" style="margin-top:8px"><button class="btn sm ghost" data-agregen="${i}">Redo this file</button></div></div>`;
-      if (r.status === 'working') return `<div class="ag-rev"><div class="row" style="justify-content:space-between"><b class="mono">${EMBER.esc(r.path)}</b><span class="dim" style="font-size:12px">redoing…</span></div><pre class="fg-code" id="ag-stream-${i}" style="max-height:60px;margin-top:6px">${EMBER.esc(r.stream || '')}</pre></div>`;
-      const v = r.v || { ok: true, skipped: true };
-      const ok = v.ok && !r.stepFails;
-      const pill = !v.ok ? (v.stage === 'syntax' ? 'syntax error' : v.stage === 'html' ? 'would blank app' : 'runtime error') : (r.stepFails ? r.stepFails + ' step' + (r.stepFails === 1 ? '' : 's') + ' failed' : 'ok');
-      const diff = makeDiff(r.base || '', r.text || '');
+      if (r.status === 'error') return `<article class="fg-rev bad"><header class="fg-rev-head"><span class="fg-path mono">${EMBER.esc(r.path)}</span><span class="fg-state danger">failed to generate</span></header>
+        <p class="fg-err">${EMBER.esc(r.err || 'The model returned nothing usable.')}</p>
+        <div class="fg-rev-foot"><button class="btn sm" data-agregen="${i}">Redo this file</button></div></article>`;
+      if (r.status === 'working') return `<article class="fg-rev"><header class="fg-rev-head"><span class="fg-path mono">${EMBER.esc(r.path)}</span><span class="fg-state">redoing…</span></header><pre class="fg-code" id="ag-stream-${i}" style="max-height:60px;margin-top:6px">${EMBER.esc(r.stream || '')}</pre></article>`;
+      const ok = r.v && r.v.ok && !r.stepFails;
+      const d = lineDiff(r.base || '', r.text || '');
       const nSteps = (r.steps && r.steps.length) || 0;
-      return `<div class="ag-rev ${r.include ? 'sel' : ''}">
-        <div class="row" style="justify-content:space-between;align-items:center">
-          <label class="ag-pick"><input type="checkbox" data-apply="${i}" ${r.include ? 'checked' : ''} ${ok ? '' : 'disabled'}>
-            <b class="mono">${EMBER.esc(r.path)} <span class="dim" style="font-weight:400">· ${r.action}${nSteps > 1 ? ' · ' + nSteps + ' steps' : ''}</span></b></label>
-          <span class="pill ${ok ? 'go' : 'danger'}">${pill}</span></div>
-        ${v.ok ? '' : `<div class="callout danger" style="margin:6px 0"><b>${v.stage === 'render' ? 'crashes when it runs' : v.stage === 'html' ? 'would blank the app' : 'broken syntax'}:</b> ${EMBER.esc(v.msg)}</div>`}
-        ${v.ok && r.stepFails ? `<div class="callout danger" style="margin:6px 0">${r.stepFails} of ${nSteps} step(s) didn't apply. Redo re-runs all steps for this file.</div>` : ''}
-        <details style="margin-top:6px"><summary class="dim" style="font-size:12px;cursor:pointer">show diff</summary><div class="fg-diff" style="margin-top:6px">${diff}</div></details>
-        <div class="row" style="margin-top:8px"><button class="btn sm ghost" data-agregen="${i}">${ok ? 'Redo this file' : 'Redo / fix'}</button></div></div>`;
+      return `<article class="fg-rev ${r.include ? 'sel' : ''} ${ok ? '' : 'bad'}">
+        <header class="fg-rev-head">
+          <label class="fg-pick"><input type="checkbox" data-apply="${i}" ${r.include ? 'checked' : ''} ${ok ? '' : 'disabled'} aria-describedby="fg-st-${i}">
+            <span class="fg-path mono">${EMBER.esc(r.path)}</span></label>
+          <span class="fg-badge">${r.action === 'create' ? 'new file' : 'edited'}${nSteps > 1 ? ' · ' + nSteps + ' steps' : ''}</span>
+          <span class="fg-stat mono" aria-label="${d.add} lines added, ${d.del} removed"><span class="add">+${d.add}</span> <span class="del">&minus;${d.del}</span></span>
+          <span class="fg-state ${ok ? 'go' : 'danger'}" id="fg-st-${i}">${ok ? (r.include ? 'will be saved' : 'not selected') : "can't be saved"}</span>
+        </header>
+        ${checkRows(r.path, r.v, r.stepFails, nSteps)}
+        <details class="fg-diffwrap" ${i === 0 || d.add + d.del <= 40 ? 'open' : ''}><summary>Changes</summary>${d.html}</details>
+        <div class="fg-rev-foot"><button class="btn sm ${ok ? 'ghost' : ''}" data-agregen="${i}">${ok ? 'Redo this file' : 'Redo and fix'}</button></div>
+      </article>`;
     }
     async function revertLast() {
       try {
         const bdir = await dir.getDirectoryHandle('_forge_backups');
         const entries = [];
         for await (const [name, h] of bdir.entries()) entries.push([name, h]);
-        if (!entries.length) return alert('No backups yet — nothing to revert.');
+        if (!entries.length) return tell('Nothing to revert', '<p>Forge hasn\'t backed up any files yet.</p>');
         entries.sort((a, b) => a[0] < b[0] ? 1 : -1);                 // newest first
         const newestStamp = entries[0][0].split('__')[0];
         const batch = entries.filter(([n]) => n.split('__')[0] === newestStamp);
         const paths = batch.map(([n]) => n.split('__').slice(1).join('/'));
-        if (!confirm(`Revert ${paths.length} file(s) to the backup from ${newestStamp.replace(/-/g, ':').replace('T', ' ').slice(0, 19)}?\n\n${paths.join('\n')}`)) return;
+        const when = newestStamp.slice(0, 10) + ' ' + newestStamp.slice(11, 19).replace(/-/g, ':');
+        const yes = await ask({ title: `Revert ${paths.length === 1 ? 'this file' : paths.length + ' files'}?`,
+          body: `<p>Restores the backup Forge made at <b>${EMBER.esc(when)}</b> UTC, just before its last save.</p>`,
+          list: paths, confirm: 'Revert', cancel: 'Cancel' });
+        if (!yes) return;
         for (const [name, h] of batch) {
           const path = name.split('__').slice(1).join('/');
           const text = await (await h.getFile()).text();
           const fh = await fileHandle(path, true); const w = await fh.createWritable(); await w.write(text); await w.close();
         }
         files = await listFiles(); if (cur && paths.includes(cur)) curText = await readFileText(cur);
+        lastApply = null;
+        banner = { title: `Reverted ${paths.length} file${paths.length === 1 ? '' : 's'}`, body: 'Reload to run the restored code.',
+          actions: [{ label: 'Reload EMBER', primary: true, run: () => location.reload() }] };
         draw();
-        setTimeout(() => { if (confirm(`Reverted ${paths.length} file(s). Reload EMBER now?`)) location.reload(); }, 50);
       } catch (e) {
-        if (e && e.name === 'NotFoundError') return alert('No backups yet — nothing to revert.');
-        alert('Revert failed: ' + (e && e.message ? e.message : e));
+        if (e && e.name === 'NotFoundError') return tell('Nothing to revert', '<p>Forge hasn\'t backed up any files yet.</p>');
+        tell('Revert failed', `<p>${EMBER.esc(e && e.message ? e.message : String(e))}</p>`);
       }
     }
     async function viewFileInline(path) {
@@ -855,7 +1092,14 @@ Module & helper conventions:
         const rv = root.querySelector('#ag-revert'); if (rv) rv.onclick = revertLast;
         return;
       }
-      const cancel = root.querySelector('#ag-cancel'); if (cancel) cancel.onclick = () => { agent = null; draw(); };
+      const cancel = root.querySelector('#ag-cancel');
+      if (cancel) cancel.onclick = async () => {
+        if (agent.phase === 'review' && agent.results.length) {
+          const yes = await ask({ title: 'Discard these changes?', body: '<p>Nothing has been written to disk. The generated changes are thrown away.</p>', confirm: 'Discard', cancel: 'Keep reviewing' });
+          if (!yes) return;
+        }
+        agent = null; draw();
+      };
       const build = root.querySelector('#ag-build'); if (build) build.onclick = agentBuild;
       const apply = root.querySelector('#ag-apply'); if (apply) apply.onclick = agentApplyAll;
       root.querySelectorAll('[data-step]').forEach(cb => cb.onchange = () => {
@@ -864,10 +1108,14 @@ Module & helper conventions:
         if (bb) bb.textContent = 'Build ' + n + ' step' + (n === 1 ? '' : 's');
       });
       root.querySelectorAll('[data-apply]').forEach(cb => cb.onchange = () => {
-        agent.results[+cb.dataset.apply].include = cb.checked;
-        const ap = root.querySelector('#ag-apply'); const n = agent.results.filter(r => r.include).length;
-        if (ap) ap.innerHTML = `<svg viewBox="0 0 24 24"><path d="M20 6L9 17l-5-5"/></svg>Apply selected (${n})`;
-        cb.closest('.ag-rev')?.classList.toggle('sel', cb.checked);
+        const i = +cb.dataset.apply;
+        agent.results[i].include = cb.checked;
+        const n = agent.results.filter(r => r.include).length;
+        const ap = root.querySelector('#ag-apply'), lbl = root.querySelector('#ag-apply-l');
+        if (lbl) lbl.textContent = `Save ${n} file${n === 1 ? '' : 's'}`;
+        if (ap) ap.disabled = !n;
+        const st = root.querySelector('#fg-st-' + i); if (st) st.textContent = cb.checked ? 'will be saved' : 'not selected';
+        cb.closest('.fg-rev')?.classList.toggle('sel', cb.checked);
       });
       root.querySelectorAll('[data-agregen]').forEach(b => b.onclick = () => agentRegen(+b.dataset.agregen));
     }
@@ -888,10 +1136,10 @@ Module & helper conventions:
     }
 
     async function newFile() {
-      const name = prompt('New file path (relative to EMBER folder), e.g. js/mymod.js or data/extra.js:');
+      const name = await ask({ title: 'New file', body: '<p>A path inside the EMBER folder.</p>', input: { label: 'Path', placeholder: 'js/mymodule.js' }, confirm: 'Create', cancel: 'Cancel' });
       if (!name) return;
       try { const fh = await fileHandle(name, true); const w = await fh.createWritable(); await w.write('// ' + name + '\n'); await w.close(); files = await listFiles(); openFile(name); }
-      catch (e) { alert('Could not create: ' + e.message); }
+      catch (e) { tell("Couldn't create the file", `<p>${EMBER.esc(e.message)}</p>`); }
     }
 
     async function revert() {
@@ -900,13 +1148,16 @@ Module & helper conventions:
         const flat = cur.replace(/\//g, '__');
         let newest = null, newestName = '';
         for await (const [name, h] of bdir.entries()) { if (name.endsWith('__' + flat) && name > newestName) { newestName = name; newest = h; } }
-        if (!newest) return alert('No backup found for ' + cur);
+        if (!newest) return tell('No backup for this file', `<p>Forge hasn't saved <code>${EMBER.esc(cur)}</code> before, so there's nothing to restore.</p>`);
         const text = await (await newest.getFile()).text();
-        if (!confirm('Restore ' + cur + ' from backup ' + newestName.split('__')[0] + '?')) return;
+        const st = newestName.split('__')[0];
+        const yes = await ask({ title: `Restore ${cur}?`, body: `<p>Puts back the version Forge backed up at <b>${EMBER.esc(st.slice(0, 10) + ' ' + st.slice(11, 19).replace(/-/g, ':'))}</b> UTC.</p>`, confirm: 'Restore', cancel: 'Cancel' });
+        if (!yes) return;
         const fh = await fileHandle(cur, true); const w = await fh.createWritable(); await w.write(text); await w.close();
-        curText = text; proposal = null; draw();
-        setTimeout(() => { if (confirm('Restored. Reload EMBER?')) location.reload(); }, 50);
-      } catch (e) { alert('Revert failed: ' + e.message); }
+        curText = text; proposal = null; lastApply = null;
+        banner = { title: `Restored ${cur}`, body: 'Reload to run the restored code.', actions: [{ label: 'Reload EMBER', primary: true, run: () => location.reload() }] };
+        draw();
+      } catch (e) { tell('Revert failed', `<p>${EMBER.esc(e.message)}</p>`); }
     }
 
     // styles for FORGE (injected once)
@@ -949,7 +1200,83 @@ Module & helper conventions:
       .ag-rev.sel{border-color:rgba(245,158,11,.4);background:rgba(245,158,11,.04)}
       .ag-pick{display:flex;align-items:center;gap:9px;cursor:pointer;min-width:0}
       .ag-pick input{width:16px;height:16px;flex:0 0 auto}
-      @media(max-width:820px){.fg-grid{grid-template-columns:1fr}.fg-side{position:static;max-height:none}}`;
+      .sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+      /* dialog */
+      .fgd-scrim{position:fixed;inset:0;z-index:1000;display:flex;align-items:center;justify-content:center;padding:20px;background:rgba(5,4,3,.72);backdrop-filter:blur(3px);animation:fgd-in .14s ease-out}
+      .fgd{width:min(480px,100%);background:var(--panel);border:1px solid var(--line-2);border-radius:14px;padding:22px 22px 18px;box-shadow:0 30px 80px rgba(0,0,0,.55)}
+      .fgd.danger{border-color:rgba(248,113,113,.35)}
+      .fgd-title{font-size:17px;font-weight:600;letter-spacing:-.2px;margin:0 0 8px}
+      .fgd-body{color:var(--t2);font-size:14px;line-height:1.55}
+      .fgd-body p{margin:0 0 8px}
+      .fgd-body code,.fg-banner code{font-family:var(--f-mono);font-size:12.5px;color:var(--t1);background:var(--bg-2);padding:1px 5px;border-radius:4px}
+      .fgd-err{color:#f7c3c3;background:rgba(248,113,113,.08);border-radius:6px;padding:8px 10px;font-size:12.5px;word-break:break-word}
+      .fgd-list{list-style:none;margin:6px 0 0;padding:8px 10px;background:var(--bg-2);border-radius:8px;font-family:var(--f-mono);font-size:12.5px;color:var(--t1);display:grid;gap:3px}
+      .fgd-field{display:grid;gap:6px;margin-top:12px;font-size:12.5px;color:var(--t2);text-transform:none;letter-spacing:0}
+      .fgd-field input{font-family:var(--f-mono)}
+      .fgd-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:18px}
+      @keyframes fgd-in{from{opacity:0}to{opacity:1}}
+      /* status bar */
+      .fg-banner{display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap;padding:12px 14px;margin-bottom:14px;border:1px solid var(--line-2);border-radius:10px;background:var(--panel)}
+      .fg-banner.go{border-color:rgba(74,222,128,.32);background:rgba(74,222,128,.05)}
+      .fg-banner.danger{border-color:rgba(248,113,113,.35);background:rgba(248,113,113,.05)}
+      .fg-banner-text{display:flex;flex-direction:column;gap:2px;min-width:0;font-size:13px;color:var(--t2)}
+      .fg-banner-text b{color:var(--t1);font-size:14px}
+      .fg-banner-actions{display:flex;align-items:center;gap:8px}
+      .fg-x{background:none;border:none;color:var(--t3);font-size:20px;line-height:1;padding:2px 6px;border-radius:6px;cursor:pointer}
+      .fg-x:hover{color:var(--t1);background:var(--panel-2)}
+      /* review */
+      .fg-review{padding:20px}
+      .fg-review-head{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;margin-bottom:14px}
+      .fg-goal{font-size:17px;font-weight:600;letter-spacing:-.2px;margin:6px 0 4px;overflow-wrap:anywhere}
+      .fg-sum{margin:0;color:var(--t2);font-size:13.5px}
+      .fg-model-tag{font-size:11px;white-space:nowrap;padding-top:2px}
+      .fg-revlist{display:grid;gap:10px}
+      .fg-rev{border:1px solid var(--line);border-radius:10px;padding:12px 14px;background:var(--bg-2)}
+      .card.fg-rev{background:var(--panel)}
+      .fg-rev.sel{border-color:rgba(245,158,11,.38)}
+      .fg-rev.bad{border-color:rgba(248,113,113,.3)}
+      .fg-rev-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+      .fg-pick{display:flex;align-items:center;gap:10px;cursor:pointer;min-width:0;text-transform:none;letter-spacing:0;font-size:13px;margin:0;color:var(--t1)}
+      .fg-pick input{width:16px;height:16px;flex:0 0 auto;accent-color:var(--amber)}
+      .fg-pick input:disabled{cursor:not-allowed}
+      .fg-path{font-size:13px;color:var(--t1);overflow-wrap:anywhere}
+      .fg-badge{font-size:11px;color:var(--t3);border:1px solid var(--line-2);border-radius:999px;padding:1px 8px}
+      .fg-stat{font-size:12px}
+      .fg-stat .add{color:var(--go)} .fg-stat .del{color:var(--danger)}
+      .fg-state{margin-left:auto;font-size:12px;color:var(--t3)}
+      .fg-state.go{color:var(--go)} .fg-state.danger{color:var(--danger)}
+      .fg-checks{list-style:none;margin:10px 0 0;padding:0;display:grid;gap:4px}
+      .fg-check{display:grid;grid-template-columns:18px 92px 1fr;align-items:baseline;gap:8px;font-size:12.5px}
+      .fg-ci svg{width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:2.6;stroke-linecap:round;stroke-linejoin:round;transform:translateY(2px)}
+      .fg-check.pass .fg-ci{color:var(--go)} .fg-check.fail .fg-ci{color:var(--danger)} .fg-check.skip .fg-ci,.fg-check.wait .fg-ci{color:var(--t3)}
+      .fg-cn{color:var(--t1);font-weight:500}
+      .fg-cd{color:var(--t2);overflow-wrap:anywhere}
+      .fg-check.fail .fg-cd{color:#f7c3c3;font-family:var(--f-mono);font-size:12px}
+      .fg-diffwrap{margin-top:10px}
+      .fg-diffwrap>summary{cursor:pointer;font-size:12px;color:var(--t3);list-style:none;user-select:none;padding:2px 0}
+      .fg-diffwrap>summary::-webkit-details-marker{display:none}
+      .fg-diffwrap>summary:before{content:'▸ ';color:var(--amber)}
+      .fg-diffwrap[open]>summary:before{content:'▾ '}
+      .fg-diffwrap>summary:hover{color:var(--t1)}
+      .fg-diff2{margin-top:6px;font-family:var(--f-mono);font-size:12px;line-height:1.6;max-height:46vh;overflow:auto;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:4px 0}
+      .fg-diff2 .dh{color:var(--t3);font-size:11px;padding:6px 12px 2px;letter-spacing:.04em}
+      .fg-diff2 .dh:not(:first-child){border-top:1px solid var(--line);margin-top:4px}
+      .fg-diff2 .dl{display:grid;grid-template-columns:38px 38px 16px 1fr}
+      .fg-diff2 .ln{color:var(--t3);text-align:right;padding-right:8px;user-select:none;font-size:11px;opacity:.75}
+      .fg-diff2 .sg{user-select:none;text-align:center}
+      .fg-diff2 .tx{white-space:pre-wrap;word-break:break-word;padding-right:12px}
+      .fg-diff2 .add{background:rgba(74,222,128,.09)} .fg-diff2 .add .sg,.fg-diff2 .add .tx{color:#bff5cf}
+      .fg-diff2 .del{background:rgba(248,113,113,.09)} .fg-diff2 .del .sg,.fg-diff2 .del .tx{color:#f7c3c3}
+      .fg-diff2 .ctx .tx{color:var(--t3)}
+      .fg-nodiff{font-size:12px;margin:6px 0 0}
+      .fg-err{color:#f7c3c3;font-size:12.5px;margin:8px 0 0}
+      .fg-rev-foot{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:10px}
+      .fg-review-foot{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:16px;padding-top:14px;border-top:1px solid var(--line)}
+      .fg-hint{font-size:12px}
+      .fg-hint kbd{font-family:var(--f-mono);font-size:11px;border:1px solid var(--line-2);border-bottom-width:2px;border-radius:4px;padding:0 4px;margin-left:2px;color:var(--t2)}
+      .btn:disabled{opacity:.45;cursor:not-allowed;filter:none}
+      @media(prefers-reduced-motion:reduce){.fgd-scrim{animation:none}}
+      @media(max-width:820px){.fg-grid{grid-template-columns:1fr}.fg-side{position:static;max-height:none}.fg-state{margin-left:0;width:100%}.fg-check{grid-template-columns:18px 84px 1fr}}`;
       document.head.appendChild(s);
     }
     draw();        // show the connect screen immediately

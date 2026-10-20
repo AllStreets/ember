@@ -1,6 +1,6 @@
 /* EMBER service worker — caches the entire console so it loads with the network
    fully dead. Cache-first for our own files; never touches the local LLM origin. */
-const CACHE = 'ember-v23';
+const CACHE = 'ember-v24';
 const ASSETS = [
   './', 'index.html', 'css/app.css', 'manifest.webmanifest', 'icon.svg',
   'data/kb.js', 'data/ref.js', 'data/guide.js',
