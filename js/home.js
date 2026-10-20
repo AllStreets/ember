@@ -15,9 +15,9 @@
         <div class="card"><div class="eyebrow">Local LLM</div>
           <div class="stat-sm" style="color:${s.online ? 'var(--go)' : 'var(--danger)'}">${s.online ? 'ONLINE' : 'OFFLINE'}</div>
           <div class="dim mono" style="font-size:12px;margin-top:4px">${s.online ? EMBER.esc(s.model || 'ready') : 'start Ollama to enable'}</div></div>
-        <div class="card"><div class="eyebrow">On-device data</div>
-          <div class="stat-sm">${Store.fmtBytes(Store.usage())}</div>
-          <div class="dim mono" style="font-size:12px;margin-top:4px">${KB.length} guides · ${window.EMBER.modules.length} modules</div></div>
+        <div class="card"><div class="eyebrow">Offline library</div>
+          <div class="stat-sm">${KB.length} guides</div>
+          <div class="dim mono" style="font-size:12px;margin-top:4px">${window.EMBER.modules.length} modules · entries saved locally</div></div>
         <div class="card"><div class="eyebrow">Status</div>
           <div class="stat-sm" style="color:var(--go)">SELF-CONTAINED</div>
           <div class="dim mono" style="font-size:12px;margin-top:4px">runs with the grid down</div></div>

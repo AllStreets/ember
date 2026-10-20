@@ -141,7 +141,7 @@ textarea{resize:vertical;min-height:80px;line-height:1.5}
 .kb-body .warn{color:var(--warn)}
 
 /* chat / advisor */
-.chat{display:flex;flex-direction:column;height:calc(100vh - 58px - 0px)}
+.chat{display:flex;flex-direction:column;flex:1;min-height:0}
 .chat-scroll{flex:1;overflow-y:auto;padding:8px 2px 16px;display:flex;flex-direction:column;gap:14px}
 .msg{max-width:760px;display:flex;gap:11px}
 .msg .av{width:28px;height:28px;border-radius:8px;flex:0 0 auto;display:flex;align-items:center;justify-content:center;

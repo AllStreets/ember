@@ -1,12 +1,12 @@
 'use strict';
 (window.EMBER_MODULES = window.EMBER_MODULES || []).push({
-  id: 'advisor', label: 'Advisor', desc: 'Ask the local AI — survival, medical, how-to',
+  id: 'advisor', label: 'Advisor', desc: 'Ask the local AI: survival, repairs, how-to',
   icon: '<svg viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H8l-4 4V6a2 2 0 0 1 2-2h11a2 2 0 0 1 2 2z"/><path d="M8 10h8M8 13h5"/></svg>',
   render(view) {
     const SYS = { role: 'system', content:
       "You are EMBER, an offline survival and practical-skills advisor running locally on the user's laptop during a grid-down emergency: no internet, no phones, solar power only. Give clear, prioritized, concrete, actionable guidance a stressed non-expert can follow. Prefer numbered steps. Be concise but complete. Assume limited supplies and improvisation. For medical or dangerous topics, give best-effort first-aid steps AND tell them to get trained/professional help the moment it's available, and to stop if a step is beyond them. Never invent facts; if unsure, say so and give the safest general approach." };
 
-    const QUICK = ['How do I purify this water safely?', 'Treat a deep bleeding wound', 'Which wild plants are safe to eat?',
+    const QUICK = ['How do I purify this water safely?', 'Treat a deep bleeding wound', 'Splint a broken forearm',
       'Start a fire without a lighter', 'Signs of hypothermia and what to do', 'Build a warm shelter tonight',
       'Ration water for 4 people, 3 days', 'Teach me long division step by step'];
 
@@ -17,7 +17,7 @@
       .replace(/`([^`]+)`/g, '<code>$1</code>')
       .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
 
-    view.innerHTML = `<div class="view-wrap" style="height:100%">
+    view.innerHTML = `<div class="view-wrap" style="height:100%;display:flex;flex-direction:column">
       <div class="row" style="justify-content:space-between;margin-bottom:12px">
         <div class="row">
           <select id="ad-model" style="width:auto;min-width:180px"></select>
@@ -28,9 +28,10 @@
       <div class="chat">
         <div class="chat-scroll" id="ad-scroll"></div>
         <div class="chat-quick" id="ad-quick">${QUICK.map(q => `<button class="q">${EMBER.esc(q)}</button>`).join('')}</div>
+        <p class="dim" style="font-size:12.5px;margin:0 0 8px">A local model can sound sure and still be wrong. For medication, doses, or anything you might eat, use the Field Guide and a printed reference, not this chat.</p>
         <div class="chat-input">
-          <textarea id="ad-input" placeholder="Ask anything — survival, first aid, repairs, math, navigation…" rows="1"></textarea>
-          <button class="btn primary" id="ad-send"><svg viewBox="0 0 24 24"><path d="M22 2L11 13M22 2l-7 20-4-9-9-4z"/></svg></button>
+          <textarea id="ad-input" aria-label="Ask the advisor" placeholder="Ask anything — survival, first aid, repairs, math, navigation…" rows="1"></textarea>
+          <button class="btn primary" id="ad-send" aria-label="Send"><svg viewBox="0 0 24 24"><path d="M22 2L11 13M22 2l-7 20-4-9-9-4z"/></svg></button>
         </div>
       </div>
     </div>`;
