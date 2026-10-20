@@ -85,6 +85,9 @@ EMBER can edit its own source code from a plain-language request, using the same
 
 The review shows, for each file, what every check found in plain words (syntax, the app shell for `index.html`, and a test render on a hidden page), then a line diff with old and new line numbers. A file that fails a check can't be ticked. Every save copies the old file into `_forge_backups/` first, and the status bar that confirms the save has an Undo button. Every question Forge asks, from "save anyway?" to "revert these files?", is one accessible dialog, not a browser popup. `forge-selftest.mjs` exercises the pipeline end to end.
 
+<p align="center"><img src=".github/assets/forge-review.gif" alt="A 31-second recording: a request typed into Forge, the local model plans and builds it, the review shows each check and the diff, Cmd+Enter saves, then Undo restores the file" width="100%"/></p>
+<p align="center"><em>Real time, with a real local model (qwen3-coder 30B). Nothing is sped up.</em></p>
+
 The review step earned its place. Early on, Forge produced a tide calculator that returned hard-coded times behind a fake loading delay. It passed every automatic check, because it was valid code that returned plausible output. I caught it reading the diff and removed it ([63127c6](https://github.com/AllStreets/ember/commit/63127c6)). A change that looks right is not the same as a change that is right, which is why a person approves every write.
 
 ---
