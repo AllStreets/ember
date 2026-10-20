@@ -88,7 +88,7 @@ The review shows, for each file, what every check found in plain words (syntax, 
 <p align="center"><img src=".github/assets/forge-review.gif" alt="A 31-second recording: a request typed into Forge, the local model plans and builds it, the review shows each check and the diff, Cmd+Enter saves, then Undo restores the file" width="100%"/></p>
 <p align="center"><em>Real time, with a real local model (qwen3-coder 30B). Nothing is sped up.</em></p>
 
-The review step earned its place. Early on, Forge produced a tide calculator that returned hard-coded times behind a fake loading delay. It passed every automatic check, because it was valid code that returned plausible output. I caught it reading the diff and removed it ([63127c6](https://github.com/AllStreets/ember/commit/63127c6)). A change that looks right is not the same as a change that is right, which is why a person approves every write.
+Why a person approves every write: early on, Forge was asked for a tide calculator and finished only the first of the three steps its plan called for, so the module sat on disk, loaded by nothing. It turned up while checking that every cached file existed. Read closely, it ignored the place and date it was given and returned the same two times behind a delay that made it look like it was calculating. It looked right at every level you would skim and was hollow where it mattered, so it was deleted rather than wired up ([63127c6](https://github.com/AllStreets/ember/commit/63127c6)). Checks catch code that is broken. Only reading catches code that is fake.
 
 ---
 
